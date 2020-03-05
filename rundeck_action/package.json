@@ -1,0 +1,15 @@
+{
+  "name": "rundeckAction",
+  "version": "0.0.1",
+  "description": "rundeck action plugin",
+  "main": "index.js",
+  "kibana": {
+    "version": "kibana"
+  },
+  "devDependencies": {
+    "fp-ts": "^2.0.5"
+  },
+  "dependencies": {
+    "fp-ts": "^2.0.5"
+  }
+}
