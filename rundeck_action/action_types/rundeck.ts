@@ -3,33 +3,19 @@
  * or more contributor license agreements. Licensed under the Elastic License;
  * you may not use this file except in compliance with the Elastic License.
  */
-import { curry } from 'lodash';
 import axios, { AxiosError, AxiosResponse } from 'axios';
 import { schema, TypeOf } from '@kbn/config-schema';
 import { nullableType } from '../../../x-pack/legacy/plugins/actions/server/builtin_action_types/lib/nullable';
-import { isOk, promiseResult, Result } from '../../../x-pack/legacy/plugins/actions/server/builtin_action_types/lib/result_type';
 import { ActionType, ActionTypeExecutorOptions, ActionTypeExecutorResult } from '../../../x-pack/legacy/plugins/actions/server/types';
-import { callPagerDutyApi, PagerDutyApiOptions, PagerDutyApiResult } from './lib/pagerduty'
-import { callSlackApi, SlackApiOptions, SlackApiResult } from './lib/slack'
+import { IncomingWebhook } from '@slack/webhook';
 import { Logger } from '../logger'
 
-
-// config definition
-enum WebhookMethods {
-  POST = 'post',
-  PUT = 'put',
-}
-
-// Schema
 const headersSchema = schema.recordOf(schema.string(), schema.string());
 
 const configSchemaProps = {
   rundeckBaseUrl: schema.uri(),
-  method: schema.oneOf([schema.literal(WebhookMethods.POST), schema.literal(WebhookMethods.PUT)], {
-    defaultValue: WebhookMethods.POST,
-  }),
   rundeckApiVersion: schema.oneOf([schema.number()], { defaultValue: 24}),
-  jobId: schema.string(),
+  rundeckJobId: schema.string(),
   headers: nullableType(headersSchema),
 };
 
@@ -43,16 +29,22 @@ const SecretsSchema = schema.object({
   slackWebhookUrl: nullableType(schema.string()),
 });
 
+/*
+ * dedupKey   : Pager Duty incident deduplicate key
+ * alertName  : alert name or description to be used when sending a message to Slack channel
+ * jobParams  : parameters used by rundeck job
+ * options    : options if needed
+ */
 type ActionParamsType = TypeOf<typeof ParamsSchema>;
 const ParamsSchema = schema.object({
   dedupKey: nullableType(schema.string()),
+  alertName: nullableType(schema.string()),
   jobParams: schema.maybe(schema.object({
     options: schema.maybe(schema.any())
   })),
 });
 
-// action type definition
-export function getActionType({ logger }: { logger: Logger }): ActionType {
+export function getActionType(logger: Logger): ActionType {
   return {
     id: '.rundeck',
     name: 'rundeck',
@@ -61,156 +53,207 @@ export function getActionType({ logger }: { logger: Logger }): ActionType {
       secrets: SecretsSchema,
       params: ParamsSchema,
     },
-    executor: curry(executor)({ logger }),
+    executor: (options) => executor(logger, options),
   };
 }
 
-// action executor
-// * Need API Key for calling PD Rest APIs
 export async function executor(
-  { logger }: { logger: Logger },
+  logger: Logger,
   execOptions: ActionTypeExecutorOptions
 ): Promise<ActionTypeExecutorResult> {
+
   const actionId = execOptions.actionId;
-  const { method, rundeckBaseUrl, rundeckApiVersion, jobId, headers = {} } = execOptions.config as ActionTypeConfigType;
-  const { rundeckApiToken } = execOptions.secrets as ActionTypeSecretsType;
-  const { dedupKey, jobParams } = execOptions.params as ActionParamsType;
 
-  Object.assign(headers, {"X-Rundeck-Auth-Token": rundeckApiToken})
+  const { 
+    rundeckBaseUrl, 
+    rundeckApiVersion, 
+    rundeckJobId, 
+    headers = {} 
+  } = execOptions.config as ActionTypeConfigType;
+  
+  const { 
+    rundeckApiToken, 
+    pdApiKey, 
+    slackWebhookUrl 
+  } = execOptions.secrets as ActionTypeSecretsType;
 
+  const { 
+    dedupKey, 
+    alertName, 
+    jobParams 
+  } = execOptions.params as ActionParamsType;
+
+  // call Rundeck job execution API
+  let rundeckResult: any;
+  try {
+    const rundeckApiOptions = {
+      actionId,
+      headers,
+      rundeckBaseUrl,
+      rundeckApiToken,
+      rundeckApiVersion, 
+      rundeckJobId, 
+      jobParams, 
+      logger,
+    }
+
+    rundeckResult = await executeRundeckJob(rundeckApiOptions);
+
+  } catch (err) { // when response code >= 300, by axios
+
+    // try to use response message first then using axios stack message
+    const message = err.response ? err.response.data.message : err.message;
+    logger.warn(`Error on ${actionId} rundeck action: ${message}`);
+    return errorResult(actionId, message);
+  }
+  
+  // retrieve the rundeck job link
+  const executionLink = rundeckResult.data.permalink;
+
+  // send slack message when "dedupKey" is not set
+  if(!dedupKey) {
+
+    if(!slackWebhookUrl) {
+      const message = "Neither of dedupKey nor slackWebhookUrl are provided, failed to send message to PagerDuty incident or slack channel.";
+      return errorSlackProcess(actionId, message);
+    }
+
+    try {
+      const webhook = new IncomingWebhook(slackWebhookUrl);
+
+      const message = {
+        "text": alertName,
+        "attachments": [
+          {
+            "text": `Rundeck job for the alert is triggered. Link: ${executionLink}`
+          }
+        ]
+      }
+      await webhook.send(message)
+
+      // nothing to do more but just logging
+      logger.info(`Sending message to Slack succeeded in rundeck action "${actionId}".`);
+
+    } catch (err) {
+
+      const message = `an error occurred while calling pager duty list incidents API: ${err.error}`
+      logger.warn(`Error on ${actionId} rundeck action: ${message}`);
+      return errorSlackProcess(actionId, message);
+    }
+
+    // return with rundeck result.
+    return successResult(rundeckResult.data);
+  }
+
+  // call Pager Duty incident list API to retrieve incident id
+  // it is needed to call add note API
+  let pdIncidentListResult: any;
+  try {
+    const pagerDutyApiOptions = {
+      headers,
+      pdApiKey,
+      dedupKey,
+    }
+
+    pdIncidentListResult = await getPagerDutyIncidentList(pagerDutyApiOptions);
+
+    logger.info(`Retrieving Pager Duty incident list succeeded in rundeck action "${actionId}".`);
+
+  } catch (err) {
+    
+    const message = err.response ? `${err.response.status} ${err.response.data.error.message}` : err.message; 
+    logger.warn(`error on ${actionId} rundeck action: an error occurred while calling pager duty API: ${message}`);
+    return errorPagerDutyProcess(actionId, message);
+  }
+
+  // incident list is empty
+  if (!pdIncidentListResult.data.incidents.length) {
+    const message: string = `Pager Duty incident list requested by dedupKey(incident_key), "${dedupKey}", is empty.`
+    logger.warn(`error on ${actionId} rundeck action: ${message}`);
+    return errorPagerDutyProcess(actionId, message);
+  }
+
+  // get incident id
+  const incidentId = pdIncidentListResult.data.incidents.pop().id
+
+  // call Pager Duty add note API
+  try {
+    const pagerDutyApiOptions = {
+      headers,
+      pdApiKey,
+      incidentId,
+      executionLink,
+    };
+
+    await addNoteToPagerDutyIncident(pagerDutyApiOptions);
+
+    logger.info(`Calling pagerduty "create a note API" step succeeded in rundeck action "${actionId}"`);
+
+  } catch (err) {
+
+    const message = err.response ? `${err.response.status} ${err.response.data.error.message}` : err.message;
+    logger.warn(`error on ${actionId} rundeck action: an error occurred while calling pager duty API: ${message}`);
+    return errorPagerDutyProcess(actionId, err.message);
+  }
+
+  logger.info(`response from rundeck action "${actionId}": [HTTP ${rundeckResult.status}] ${rundeckResult.statusText}`);    
+  
+  return successResult(rundeckResult.data);
+  
+}
+
+async function executeRundeckJob(rundeckApiOptions: any): Promise<AxiosResponse|AxiosError> {
+
+  const {
+    headers, 
+    rundeckBaseUrl,
+    rundeckApiToken, 
+    rundeckApiVersion, 
+    rundeckJobId, 
+    jobParams,
+  } = rundeckApiOptions;
+
+  // add rundeck api token to headers
+  Object.assign(headers, {"X-Rundeck-Auth-Token": rundeckApiToken});
+
+  // trim last '/' in the rundeckBaseUrl
   const rundeckBaseUrlWithoutSlash = rundeckBaseUrl.endsWith('/') ? rundeckBaseUrl.slice(0, -1) : rundeckBaseUrl;
 
-  const rundeckApiUrl = `${rundeckBaseUrlWithoutSlash}/api/${rundeckApiVersion}/job/${jobId}/executions`;
+  const rundeckApiUrl = `${rundeckBaseUrlWithoutSlash}/api/${rundeckApiVersion}/job/${rundeckJobId}/executions`;
 
-  const rundeckResult: Result<AxiosResponse, AxiosError> = await promiseResult(
-    axios.request({
-      method,
-      url: rundeckApiUrl,
-      headers,
-      data: jobParams
-    })
-  ); 
+  return axios.post(rundeckApiUrl, jobParams, { headers });
+}
 
-  if (isOk(rundeckResult)) {
-    const {
-      value: { status, statusText, data: { permalink: executionLink }},
-    } = rundeckResult;
+async function getPagerDutyIncidentList(pagerDutyApiOptions: any): Promise<AxiosResponse|AxiosError> {
 
-    let {
-      value: {data: responseData}
-    } = rundeckResult
+  const {headers, pdApiKey, dedupKey} = pagerDutyApiOptions;
 
-    // pageduty APIs
-    const pdIncidentListApiBaseUrl = 'https://api.pagerduty.com/incidents?incident_key=';
-    const pdAddNoteApiBaseUrl = 'https://api.pagerduty.com/incidents/';
+  Object.assign(headers, {authorization: `Token token=${pdApiKey}`});
 
-    if (dedupKey) {
+  const pdIncidentListApiUrl = `https://api.pagerduty.com/incidents?incident_key=${dedupKey}`;
 
-      const { headers = {} } = execOptions.config as ActionTypeConfigType;
-      const { pdApiKey } = execOptions.secrets as ActionTypeSecretsType;
+  return axios.get(pdIncidentListApiUrl, { headers });
+}
 
-      Object.assign(headers, {"authorization": `Token token=${pdApiKey}`})
+async function addNoteToPagerDutyIncident(pagerDutyApiOptions: any): Promise<AxiosResponse|AxiosError> {
 
-      const pdIncidentListApiOptions: PagerDutyApiOptions = {
-        actionId,
-        url: `${pdIncidentListApiBaseUrl}${dedupKey}`,
-        method: "get",
-        headers,
-        dedupKey,
-        data: {},
-        logger,
-      }
+  const { headers, 
+    pdApiKey, 
+    incidentId,
+    executionLink,
+  } = pagerDutyApiOptions;
 
-      const pdIncidentListResult: PagerDutyApiResult = await callPagerDutyApi(pdIncidentListApiOptions);
+  Object.assign(headers, {authorization: `Token token=${pdApiKey}`});
 
-      if (pdIncidentListResult.status === "error") {
-        logger.warn(`error on ${actionId} rundeck action: ${pdIncidentListResult.message}`);
-        return errorPagerDutyProcess(actionId, pdIncidentListResult.message);
-      }
+  const pdAddNoteApiUrl = `https://api.pagerduty.com/incidents/${incidentId}/notes`;
 
-      // incident list is empty
-      if (pdIncidentListResult.data.incidents.length == 0) {
-        const message: string = `Pager Duty incident list requested by dedupKey(incident_key), "${dedupKey}", is empty.`
-        return errorPagerDutyProcess(actionId, message);
-      }
-
-      // call PD create note api
-      const { id: incidentId } = pdIncidentListResult.data.incidents.slice(-1)[0]
-
-      const noteMessage = {
-        note: {
-          content: `Rundeck job for the alert is triggered. Link: ${executionLink}`
-        }
-      };
-
-      const pdAddNoteApiOptions: PagerDutyApiOptions = {
-        actionId,
-        url: `${pdAddNoteApiBaseUrl}${incidentId}/notes`,
-        method: "post",
-        headers,
-        dedupKey,
-        data: noteMessage,
-        logger,
-      }
-
-      const pdCreateNoteResult: PagerDutyApiResult = await callPagerDutyApi(pdAddNoteApiOptions);
-
-      if (pdCreateNoteResult.status === "error") {
-        logger.warn(`error on ${actionId} rundeck action: ${pdCreateNoteResult.message}`);
-        return errorPagerDutyProcess(actionId, pdCreateNoteResult.message);
-      }
-
-      logger.info(`Calling pagerduty "create a note API" step succeeded in rundeck action "${actionId}"`);
-
-    } else {
-      const actionId = execOptions.actionId;
-      const { slackWebhookUrl } = execOptions.secrets as ActionTypeSecretsType;
-      const message = `Rundeck job for the alert is triggered. Link: ${executionLink}`
-
-      const slackApiOptions: SlackApiOptions = {
-        actionId,
-        slackWebhookUrl,
-        message,
-        logger,
-      }
-
-      const slackMessageResult: SlackApiResult = await callSlackApi(slackApiOptions);
-
-      if (slackMessageResult.status === "error") {
-        return errorSlackProcess(actionId, slackMessageResult.message);
-      }
-
-      logger.info(`Sending message to slack step succeeded in rundeck action "${actionId}"`);
+  const noteMessage = {
+    note: {
+      content: `Rundeck job for the alert is triggered. Link: ${executionLink}`
     }
+  };
 
-    logger.info(`response from rundeck action "${actionId}": [HTTP ${status}] ${statusText}`);    
-    
-    return successResult(responseData);
-  } else {
-    const { error } = rundeckResult;
-
-    if (error.response) {
-      const { status, statusText, headers: responseHeaders } = error.response;
-      const message = `[${status}] ${statusText}`;
-
-      logger.warn(`error on ${actionId} rundeck event: ${message}`);
-
-      // The request was made and the server responded with a status code
-      // that falls out of the range of 2xx
-      // special handling for 5xx
-      if (status >= 500) {
-        return retryResult(actionId, message);
-      }
-
-      return errorResultInvalid(actionId, message);
-    }
-
-    const message = 'Unreachable rundeck host, are you sure the address is correct?'
-    
-    logger.warn(`error on ${actionId} rundeck action: ${message}`);
-
-    return errorResultUnreachable(actionId, message);
-  }
+  return axios.post(pdAddNoteApiUrl, noteMessage, { headers });
 }
 
 function successResult(data: any): ActionTypeExecutorResult {
@@ -218,7 +261,7 @@ function successResult(data: any): ActionTypeExecutorResult {
 }
 
 function errorPagerDutyProcess(id: string, message: string): ActionTypeExecutorResult {
-  const errMessage = `Invalid Response: an error occurred in rundeck action "${id}": ${message}`;
+  const errMessage = `An error occurred while calling Pager Duty API in rundeck action "${id}": ${message}`;
   return {
     status: 'error',
     message: errMessage,
@@ -233,7 +276,7 @@ function errorSlackProcess(id: string, message: string): ActionTypeExecutorResul
   };
 }
 
-function errorResultInvalid(id: string, message: string): ActionTypeExecutorResult {
+function errorResult(id: string, message: string): ActionTypeExecutorResult {
   const errMessage = `Invalid Response: an error occurred in rundeck action "${id}" calling a rundeck job: ${message}`;
   return {
     status: 'error',
@@ -241,19 +284,3 @@ function errorResultInvalid(id: string, message: string): ActionTypeExecutorResu
   };
 }
 
-function errorResultUnreachable(id: string, message: string): ActionTypeExecutorResult {
-  const errMessage = `Unreachable Webhook: an error occurred in rundeck action "${id}" calling a rundeck job: ${message}`;
-  return {
-    status: 'error',
-    message: errMessage,
-  };
-}
-
-function retryResult(id: string, message: string): ActionTypeExecutorResult {
-  const errMessage = `Invalid Response: an error occurred in rundeck action "${id}" calling a rundeck job, retry later`
-  return {
-    status: 'error',
-    message: errMessage,
-    retry: true,
-  };
-}

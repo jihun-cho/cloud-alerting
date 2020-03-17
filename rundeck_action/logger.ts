@@ -16,7 +16,7 @@ export class Logger {
   }
 
   warn(message: string) {
-    this.server.log(['warn', this.plugin], message)
+    this.server.log(['warning', this.plugin], message)
   }
 
   error(message: string) {

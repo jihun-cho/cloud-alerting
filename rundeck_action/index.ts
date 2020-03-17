@@ -16,7 +16,7 @@ export let serverLog: Logger
 
 function init(server: any) {
   serverLog = new Logger(server, PLUGIN_NAME)
-  registerActionType(server, getRundeckActionType({ logger: serverLog }))
+  registerActionType(server, getRundeckActionType(serverLog))
 }
 
 function registerActionType(server: any, actionType: ActionType) {
