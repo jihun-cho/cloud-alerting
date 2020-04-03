@@ -136,7 +136,7 @@ export async function executor(
 
     } catch (err) {
 
-      const message = `an error occurred while calling pager duty list incidents API: ${err.error}`
+      const message = `an error occurred while calling slack webhook: ${err.error}`
       logger.warn(`Error on ${actionId} rundeck action: ${message}`);
       return errorSlackProcess(actionId, message);
     }
@@ -156,6 +156,8 @@ export async function executor(
     }
 
     pdIncidentListResult = await getPagerDutyIncidentList(pagerDutyApiOptions);
+
+    console.log(pdIncidentListResult);
 
     logger.info(`Retrieving Pager Duty incident list succeeded in rundeck action "${actionId}".`);
 
@@ -202,48 +204,42 @@ export async function executor(
   
 }
 
-async function executeRundeckJob(rundeckApiOptions: any): Promise<AxiosResponse|AxiosError> {
-
-  const {
-    headers, 
-    rundeckBaseUrl,
-    rundeckApiToken, 
-    rundeckApiVersion, 
-    rundeckJobId, 
-    jobParams,
-  } = rundeckApiOptions;
+async function executeRundeckJob({
+  headers, 
+  rundeckBaseUrl,
+  rundeckApiToken, 
+  rundeckApiVersion, 
+  rundeckJobId, 
+  jobParams,
+}): Promise<AxiosResponse|AxiosError> {
 
   // add rundeck api token to headers
-  Object.assign(headers, {"X-Rundeck-Auth-Token": rundeckApiToken});
+  headers = Object.assign({}, headers, {"X-Rundeck-Auth-Token": rundeckApiToken});
 
   // trim last '/' in the rundeckBaseUrl
   const rundeckBaseUrlWithoutSlash = rundeckBaseUrl.endsWith('/') ? rundeckBaseUrl.slice(0, -1) : rundeckBaseUrl;
 
   const rundeckApiUrl = `${rundeckBaseUrlWithoutSlash}/api/${rundeckApiVersion}/job/${rundeckJobId}/executions`;
 
-  return axios.post(rundeckApiUrl, jobParams, { headers });
+  return await axios.post(rundeckApiUrl, jobParams, { headers });
 }
 
-async function getPagerDutyIncidentList(pagerDutyApiOptions: any): Promise<AxiosResponse|AxiosError> {
+async function getPagerDutyIncidentList({headers, pdApiKey, dedupKey}): Promise<AxiosResponse|AxiosError> {
 
-  const {headers, pdApiKey, dedupKey} = pagerDutyApiOptions;
+  headers = Object.assign({}, headers, {authorization: `Token token=${pdApiKey}`});
 
-  Object.assign(headers, {authorization: `Token token=${pdApiKey}`});
+  const pdIncidentListApiUrl = `https://api.pagerduty.com/incidents?date_range=all&incident_key=${dedupKey}`;
 
-  const pdIncidentListApiUrl = `https://api.pagerduty.com/incidents?incident_key=${dedupKey}`;
-
-  return axios.get(pdIncidentListApiUrl, { headers });
+  return await axios.get(pdIncidentListApiUrl, { headers });
 }
 
-async function addNoteToPagerDutyIncident(pagerDutyApiOptions: any): Promise<AxiosResponse|AxiosError> {
+async function addNoteToPagerDutyIncident({ headers, 
+  pdApiKey, 
+  incidentId,
+  executionLink,
+}): Promise<AxiosResponse|AxiosError> {
 
-  const { headers, 
-    pdApiKey, 
-    incidentId,
-    executionLink,
-  } = pagerDutyApiOptions;
-
-  Object.assign(headers, {authorization: `Token token=${pdApiKey}`});
+  headers = Object.assign({}, headers, {authorization: `Token token=${pdApiKey}`});
 
   const pdAddNoteApiUrl = `https://api.pagerduty.com/incidents/${incidentId}/notes`;
 
