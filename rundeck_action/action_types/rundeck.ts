@@ -157,8 +157,6 @@ export async function executor(
 
     pdIncidentListResult = await getPagerDutyIncidentList(pagerDutyApiOptions);
 
-    console.log(pdIncidentListResult);
-
     logger.info(`Retrieving Pager Duty incident list succeeded in rundeck action "${actionId}".`);
 
   } catch (err) {
